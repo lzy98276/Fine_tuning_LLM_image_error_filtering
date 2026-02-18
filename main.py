@@ -1,5 +1,5 @@
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.message_components import Image, Record, Video, File as FileComponent, At
+from astrbot.api.message_components import Image, Record, Video, File as FileComponent, At, Poke
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
@@ -108,9 +108,17 @@ class MyPlugin(Star):
                     return True
         return False
 
+    def _has_poke(self, event: AstrMessageEvent) -> bool:
+        for seg in event.get_messages():
+            if isinstance(seg, Poke):
+                return True
+        return False
+
     def _allow_llm(self, event: AstrMessageEvent) -> bool:
         if self._is_media_message(event):
             return False
+        if self._has_poke(event):
+            return True
         if self._is_private(event) and not self._friend_needs_prefix:
             return True
         if self._has_wake_prefix(event):
