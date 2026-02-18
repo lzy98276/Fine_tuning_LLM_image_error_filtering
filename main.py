@@ -1,5 +1,5 @@
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.message_components import Image, Record, Video, File as FileComponent
+from astrbot.api.message_components import Image, Record, Video, File as FileComponent, At
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
@@ -8,6 +8,7 @@ class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self._wake_prefixes = ["/"]
+        self._friend_needs_prefix = False
 
     def _is_media_message(self, event: AstrMessageEvent) -> bool:
         chain = event.get_messages()
@@ -62,8 +63,14 @@ class MyPlugin(Star):
                 candidates.append(val)
 
         prefixes = []
+        friend_needs_prefix = None
         for mapping in candidates:
             prefixes.extend(self._extract_wake_prefixes_from_mapping(mapping))
+            ps = mapping.get("platform_settings")
+            if isinstance(ps, dict) and friend_needs_prefix is None:
+                friend_needs_prefix = ps.get("friend_message_needs_wake_prefix")
+        if isinstance(friend_needs_prefix, bool):
+            self._friend_needs_prefix = friend_needs_prefix
         return prefixes
 
     def _has_wake_prefix(self, event: AstrMessageEvent) -> bool:
@@ -72,6 +79,46 @@ class MyPlugin(Star):
         for prefix in self._wake_prefixes:
             if prefix and text.startswith(prefix):
                 return True
+        return False
+
+    def _is_private(self, event: AstrMessageEvent) -> bool:
+        msg = getattr(event, "message_obj", None)
+        gid = getattr(msg, "group_id", "")
+        return not gid
+
+    def _is_mentioning_bot(self, event: AstrMessageEvent) -> bool:
+        msg = getattr(event, "message_obj", None)
+        sid = str(getattr(msg, "self_id", ""))
+        for seg in event.get_messages():
+            if isinstance(seg, At):
+                qq = str(getattr(seg, "qq", ""))
+                name = str(getattr(seg, "name", ""))
+                if qq and qq == sid:
+                    return True
+                if name and name == sid:
+                    return True
+        return False
+
+    def _is_reply(self, event: AstrMessageEvent) -> bool:
+        msg = getattr(event, "message_obj", None)
+        raw = getattr(msg, "raw_message", None)
+        if isinstance(raw, dict):
+            for k in ("reply", "reply_to_message", "quote", "source"):
+                if raw.get(k):
+                    return True
+        return False
+
+    def _allow_llm(self, event: AstrMessageEvent) -> bool:
+        if self._is_media_message(event):
+            return False
+        if self._is_private(event) and not self._friend_needs_prefix:
+            return True
+        if self._has_wake_prefix(event):
+            return True
+        if self._is_mentioning_bot(event):
+            return True
+        if self._is_reply(event):
+            return True
         return False
 
     def _log_block(self, event: AstrMessageEvent, stage: str, reason: str):
@@ -101,18 +148,14 @@ class MyPlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req):
-        if self._is_media_message(event):
-            self._log_block(event, "on_llm_request", "media_message")
-            event.stop_event()
-            return
-
-        if not self._has_wake_prefix(event):
-            self._log_block(event, "on_llm_request", "missing_wake_prefix")
+        if not self._allow_llm(event):
+            reason = "media_message" if self._is_media_message(event) else "no_wake_prefix_or_mention_or_reply"
+            self._log_block(event, "on_llm_request", reason)
             event.stop_event()
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
-        if not self._is_media_message(event) and self._has_wake_prefix(event):
+        if self._allow_llm(event):
             return
         result = event.get_result()
         if result is not None and hasattr(result, "chain"):
@@ -121,7 +164,7 @@ class MyPlugin(Star):
                 chain.clear()
             else:
                 setattr(result, "chain", [])
-        reason = "media_message" if self._is_media_message(event) else "missing_wake_prefix"
+        reason = "media_message" if self._is_media_message(event) else "no_wake_prefix_or_mention_or_reply"
         self._log_block(event, "on_decorating_result", reason)
         event.stop_event()
 
