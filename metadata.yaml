@@ -1,6 +1,6 @@
-name: 过滤图片消息
+name: astrbot_plugin_Block_non_text_messages
 display_name: 过滤图片消息
 desc: 过滤包含图片/语音/视频/文件段的消息，避免后续流程处理这些消息导致报错。
 version: v1.0.0
-author: lzy98276
+author: 黎泽懿_Aionflux
 repo: https://github.com/lzy98276/Fine_tuning_LLM_image_error_filtering
