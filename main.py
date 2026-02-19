@@ -1,5 +1,5 @@
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.message_components import Image, Record, Video, File as FileComponent, At, Poke
+from astrbot.api.message_components import Image, Record, Video, File as FileComponent, At, Poke, Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
@@ -279,6 +279,23 @@ class MyPlugin(Star):
 
         return changed
 
+    def _result_contains_text(self, result, needle: str) -> bool:
+        if not needle or result is None:
+            return False
+        chain = getattr(result, "chain", None)
+        if not isinstance(chain, list):
+            return False
+        for seg in chain:
+            if isinstance(seg, Plain):
+                text = getattr(seg, "text", "") or ""
+                if needle in text:
+                    return True
+                continue
+            text = getattr(seg, "text", None)
+            if isinstance(text, str) and needle in text:
+                return True
+        return False
+
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
         prefixes = self._load_wake_prefixes_from_context()
@@ -316,9 +333,20 @@ class MyPlugin(Star):
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
+        result = event.get_result()
+        if self._result_contains_text(result, "LLM 响应错误"):
+            if result is not None and hasattr(result, "chain"):
+                chain = getattr(result, "chain", None)
+                if hasattr(chain, "clear"):
+                    chain.clear()
+                else:
+                    setattr(result, "chain", [])
+            self._log_block(event, "on_decorating_result", "llm_response_error_text")
+            event.stop_event()
+            return
+
         if not self._is_media_message(event) and not self._quoted_has_media(event):
             return
-        result = event.get_result()
         if result is not None and hasattr(result, "chain"):
             chain = getattr(result, "chain", None)
             if hasattr(chain, "clear"):
