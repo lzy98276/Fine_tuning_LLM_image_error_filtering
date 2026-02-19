@@ -3,7 +3,7 @@ from astrbot.api.message_components import Image, Record, Video, File as FileCom
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
-@register("image_message_filter", "YourName", "过滤图片消息的插件", "1.0.0")
+@register("image_message_filter", "黎泽懿", "过滤图片消息的插件", "1.0.0")
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -108,6 +108,50 @@ class MyPlugin(Star):
                     return True
         return False
 
+    def _raw_contains_media(self, obj) -> bool:
+        media_types = {"image", "record", "video", "file", "photo", "voice", "audio", "document"}
+        if isinstance(obj, dict):
+            msg = obj.get("message")
+            if isinstance(msg, list):
+                for seg in msg:
+                    if self._raw_contains_media(seg):
+                        return True
+                return False
+
+            t = obj.get("type")
+            if isinstance(t, str) and t.lower() in media_types:
+                return True
+
+            msgs = obj.get("messages")
+            if isinstance(msgs, list):
+                for seg in msgs:
+                    if self._raw_contains_media(seg):
+                        return True
+                return False
+
+            data = obj.get("data")
+            if isinstance(data, (dict, list)):
+                return self._raw_contains_media(data)
+
+            return False
+        if isinstance(obj, list):
+            for it in obj:
+                if self._raw_contains_media(it):
+                    return True
+            return False
+        return False
+
+    def _quoted_has_media(self, event: AstrMessageEvent) -> bool:
+        msg = getattr(event, "message_obj", None)
+        raw = getattr(msg, "raw_message", None)
+        if not isinstance(raw, dict):
+            return False
+        for k in ("reply", "reply_to_message", "quote", "source"):
+            part = raw.get(k)
+            if part and self._raw_contains_media(part):
+                return True
+        return False
+
     def _has_poke(self, event: AstrMessageEvent) -> bool:
         for seg in event.get_messages():
             if isinstance(seg, Poke):
@@ -115,7 +159,7 @@ class MyPlugin(Star):
         return False
 
     def _allow_llm(self, event: AstrMessageEvent) -> bool:
-        if self._is_media_message(event):
+        if self._is_media_message(event) or self._quoted_has_media(event):
             return False
         if self._has_poke(event):
             return True
@@ -142,6 +186,99 @@ class MyPlugin(Star):
             event.get_messages(),
         )
 
+    def _llm_request_contains_image_url(self, obj) -> bool:
+        if isinstance(obj, dict):
+            t = obj.get("type")
+            if isinstance(t, str) and t.lower() == "image_url":
+                return True
+            if "image_url" in obj and (t is None or (isinstance(t, str) and t.lower() == "image_url")):
+                return True
+            for v in obj.values():
+                if isinstance(v, (dict, list)) and self._llm_request_contains_image_url(v):
+                    return True
+            return False
+        if isinstance(obj, list):
+            for it in obj:
+                if isinstance(it, (dict, list)) and self._llm_request_contains_image_url(it):
+                    return True
+            return False
+        return False
+
+    def _sanitize_llm_request(self, req) -> bool:
+        changed = False
+
+        def sanitize(obj):
+            nonlocal changed
+
+            if isinstance(obj, dict):
+                t = obj.get("type")
+                if isinstance(t, str) and t.lower() in {"image_url", "input_image"}:
+                    obj.clear()
+                    obj.update({"type": "text", "text": "[媒体内容已过滤]"})
+                    changed = True
+                    return
+
+                if "image_url" in obj and (t is None or (isinstance(t, str) and t.lower() == "image_url")):
+                    obj.clear()
+                    obj.update({"type": "text", "text": "[媒体内容已过滤]"})
+                    changed = True
+                    return
+
+                content = obj.get("content")
+                if isinstance(content, list):
+                    new_content = []
+                    removed = 0
+                    for part in content:
+                        if isinstance(part, dict):
+                            pt = part.get("type")
+                            if isinstance(pt, str) and pt.lower() in {"image_url", "input_image"}:
+                                removed += 1
+                                continue
+                            if "image_url" in part and (
+                                pt is None or (isinstance(pt, str) and pt.lower() == "image_url")
+                            ):
+                                removed += 1
+                                continue
+                        new_content.append(part)
+                    if removed:
+                        changed = True
+                        obj["content"] = new_content or [{"type": "text", "text": "[媒体内容已过滤]"}]
+
+                for v in obj.values():
+                    if isinstance(v, (dict, list)):
+                        sanitize(v)
+                return
+
+            if isinstance(obj, list):
+                for it in obj:
+                    if isinstance(it, (dict, list)):
+                        sanitize(it)
+
+        if req is None:
+            return False
+
+        if isinstance(req, (dict, list)):
+            sanitize(req)
+            return changed
+
+        for attr in ("messages", "payload", "body", "data"):
+            try:
+                val = getattr(req, attr)
+            except Exception:
+                continue
+            if isinstance(val, (dict, list)):
+                sanitize(val)
+                try:
+                    setattr(req, attr, val)
+                except Exception:
+                    pass
+
+        d = getattr(req, "__dict__", None)
+        if isinstance(d, dict):
+            sanitize(d)
+
+        return changed
+
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
         prefixes = self._load_wake_prefixes_from_context()
@@ -150,20 +287,36 @@ class MyPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        if self._is_media_message(event):
-            self._log_block(event, "on_message", "media_message")
+        if self._is_media_message(event) or self._quoted_has_media(event):
+            reason = "media_message" if self._is_media_message(event) else "quoted_media_message"
+            self._log_block(event, "on_message", reason)
             event.stop_event()
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req):
+        get_result = getattr(event, "get_result", None)
+        if callable(get_result) and get_result() is not None:
+            return
+
         if not self._allow_llm(event):
-            reason = "media_message" if self._is_media_message(event) else "no_wake_prefix_or_mention_or_reply"
+            if self._is_media_message(event):
+                reason = "media_message"
+            elif self._quoted_has_media(event):
+                reason = "quoted_media_message"
+            else:
+                reason = "no_wake_prefix_or_mention_or_reply"
             self._log_block(event, "on_llm_request", reason)
+            event.stop_event()
+            return
+
+        self._sanitize_llm_request(req)
+        if self._llm_request_contains_image_url(req):
+            self._log_block(event, "on_llm_request", "llm_request_contains_image_url")
             event.stop_event()
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
-        if self._allow_llm(event):
+        if not self._is_media_message(event) and not self._quoted_has_media(event):
             return
         result = event.get_result()
         if result is not None and hasattr(result, "chain"):
@@ -172,7 +325,10 @@ class MyPlugin(Star):
                 chain.clear()
             else:
                 setattr(result, "chain", [])
-        reason = "media_message" if self._is_media_message(event) else "no_wake_prefix_or_mention_or_reply"
+        if self._is_media_message(event):
+            reason = "media_message"
+        elif self._quoted_has_media(event):
+            reason = "quoted_media_message"
         self._log_block(event, "on_decorating_result", reason)
         event.stop_event()
 
